@@ -1,0 +1,329 @@
+#include <MKL25Z4.h>
+#include <stdio.h>
+#include <string.h>  // Add this line
+#include <stdbool.h>
+
+#define ECHO_PIN_EXIT 4     // PTC2 connected to the exit HC-SR04 echo pin
+#define ECHO_PIN_ENTRY 5      // PTC1 connected to the entry HC-SR04 echo pin
+#define MAX_DISTANCE 10  // Maximum distance for motion detection in centimeters
+#include "utils.h"
+#define RS 0x04 /* PTA2 mask */
+#define RW 0x10 /* PTA4 mask */
+#define EN 0x20 /* PTA5 mask */
+
+#define VREF 3300  // Reference voltage in mV
+#define MAX_DAC_VALUE 4095  // 12-bit DAC
+
+
+
+
+#define clock_freq 21600000  // this is the clock frquency of the KL25Z128, it is approximation not the exact value of the clock frequcny 
+#define pwm_freq 50        // pwm frequency for servo control
+#define prescale 16            // TPM prescaler setting
+
+
+volatile uint32_t entryCount = 0;
+volatile uint32_t exitCount = 0;
+volatile uint32_t totalPeople = 0; // Calculate total people inside by entryCount - exitCount
+volatile char debounceEntry = 1;
+volatile char debounceExit = 1;
+char tempBuffer[20];  // Buffer for temperature display
+char peopleBuffer[20]; // Buffer for people count display
+volatile bool readyToReadTemperature = true; // Flag to control ADC reading
+volatile float temperature = 0.0; // Store temperature globally if needed elsewhere
+float read_temperature();
+volatile int key_value = 0;
+volatile int digit_count = 0;
+
+
+void configureButtonInterrupt(void);
+void PORTA_IRQHandler(void);
+void setupBuzzerAndLED(void);
+void processSensor(uint32_t *sensorCount, volatile char *debounceStatus, uint32_t echoPin);
+
+
+void servo_poziyon(int pulse_genisligi);
+void set_pwm(void);
+void setupSensor(void);
+void Init_TPM1_for_TriggerPulse(void);
+uint32_t TIMER_Read(void);
+void Init_TPM0_for_Microseconds(void);
+void Delay(volatile unsigned int time_del);
+void set_pwm_for_second_servo(void);
+void second_servo_position(int pulse_genisligi);
+void ADC0_init(void);
+void DAC0_init(void);
+void DAC0_set_voltage(int millivolts);
+void check_password(void);
+
+
+
+void Init_TPM0_for_Microseconds(void) {
+    // Similar setup as TPM1, but used for measuring time
+    SIM->SCGC6 |= SIM_SCGC6_TPM0_MASK;
+    TPM0->MOD = 0xFFFF;  // Max modulo value for maximum counting period
+    TPM0->SC = TPM_SC_CMOD(1) | TPM_SC_PS(4); // Clock mode on and prescaler to 16
+}
+
+
+int main(void) {
+    set_pwm_for_second_servo();
+	  set_pwm();
+	  setupSensor();
+    Init_TPM1_for_TriggerPulse();
+    Init_TPM0_for_Microseconds();  
+    setupBuzzerAndLED();
+    configureButtonInterrupt();                    // Initialize the PWM settings for the servo
+    LCD_init();
+		ADC0_init();
+    DAC0_init();
+    keypad_init();
+   while (1) {
+
+			   
+		    processSensor(&entryCount, &debounceEntry, ECHO_PIN_ENTRY);
+        processSensor(&exitCount, &debounceExit, ECHO_PIN_EXIT);
+
+        totalPeople = entryCount - exitCount; // Update the total count
+		    if (totalPeople > 3) {
+						second_servo_position(675);  // Servo on channel 0 to 0 degrees
+            Delay(950463);
+            second_servo_position(3340); // Servo on channel 0 to 180 degrees
+       }
+				if (totalPeople > 5) {
+            DAC0_set_voltage(2200);  // Set DAC output to 3V
+
+        } else {
+            DAC0_set_voltage(0);  // Set DAC output to 0V
+        }
+
+        
+        Delay(1000);
+
+
+//			  clear_lcd();
+			  LCD_command(0x80);
+			  sprintf(peopleBuffer, "People: %lu", totalPeople);
+        print_fnc(peopleBuffer); // Display people count
+
+         // Main loop delay or wait
+        read_temperature();
+				check_password();
+
+		}  	
+}
+
+
+void check_password() {
+    int key = get_number_from_keypad(); // Retrieve key press
+
+    if (key >= 0 && key <= 9) { // Only process numeric characters
+        key_value = key_value * 10 + key; // Build the password
+        digit_count++; // Increment the count of digits entered
+
+        if (digit_count == 3) { // After three digits, check the password
+            if (key_value == 147) {
+                servo_poziyon(2007); // Correct password
+                Delay(2000000);
+                servo_poziyon(675);
+            } else {
+            PTB->PSOR = (1 << 1);
+            Delay(2000000);
+            PTB->PCOR = (1 << 1);
+            }
+            // Reset the state for the next input sequence
+            key_value = 0;
+            digit_count = 0;
+        }
+    }
+}
+
+
+void DAC0_init(void) {
+    SIM->SCGC6 |= SIM_SCGC6_DAC0_MASK;  // Enable clock to DAC0
+    DAC0->C1 = 0;                       // Disable the use of the buffer
+    DAC0->C0 = DAC_C0_DACEN_MASK | DAC_C0_DACRFS_MASK;  // Enable DAC and select VREFH as reference voltage
+}
+void DAC0_set_voltage(int millivolts) {
+    if (millivolts <= VREF) {
+        int dac_value = (millivolts * MAX_DAC_VALUE) / VREF;
+        DAC0->DAT[0].DATL = (uint8_t)(dac_value & 0xFF);
+        DAC0->DAT[0].DATH = (uint8_t)((dac_value >> 8) & 0x0F);
+    }
+}
+
+float read_temperature(void) {
+    int result;
+    ADC0->SC1[0] = ADC_SC1_ADCH(13); // Assuming channel 14 is correct
+    while (!(ADC0->SC1[0] & ADC_SC1_COCO_MASK)); // Wait for conversion to complete
+    result = ADC0->R[0];
+    temperature = result * 200.0 / 65536; // Convert result to temperature
+//	clear_lcd();
+  Delay(500000);	
+	LCD_command(0xc0);
+	print_fnc("Temp:");
+	int temp_whole = (int)temperature;
+	int first_decimal = (int)((temperature - temp_whole) * 10);
+
+    int hundreds = temp_whole / 100;
+    if (hundreds > 0) {
+        LCD_data(hundreds + '0');
+        temp_whole %= 100;
+    }
+
+    
+    int tens = temp_whole / 10;
+    if (tens > 0 || hundreds > 0) { 
+        LCD_data(tens + '0');
+    }
+
+    
+    int ones = temp_whole % 10;
+    LCD_data(ones + '0');
+
+    
+    LCD_data('.');
+    LCD_data(first_decimal + '0');
+    LCD_data('C'); 
+		Delay(500000);
+}
+void ADC0_init(void)
+{
+SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+PORTB->PCR[3] = 0; /* PTE20 analog input */
+SIM->SCGC6 |= 0x8000000; /* clock to ADC0 */
+ADC0->SC2 &= ~0x40; /* software trigger */
+ADC0->SC3 |= 0x07; /* 32 samples average */
+/* clock div by 4, long sample time, single ended 16 bit, bus clock */
+ADC0->CFG1 = 0x40 | 0x10 | 0x0C | 0x00;
+}
+
+
+
+void configureButtonInterrupt(void) {
+    SIM->SCGC5 |= 0x0200; // Enable clock to Port A
+    
+    PORTA->PCR[1] |= 0xA0103; // Set PTA1 for GPIO with interrupt on falling edge
+    NVIC_EnableIRQ(PORTA_IRQn);  // Enable interrupts from Port A in the NVIC
+}
+
+void PORTA_IRQHandler(void) {
+    if (PORTA->ISFR & (1 << 1)) {
+        PORTA->ISFR = (1 << 1);  // Clear the interrupt flag
+        PTB->PSOR = (1 << 0); // Set PTB1 high
+        PTB->PSOR = (1 << 1); // Set PTB1 high
+        servo_poziyon(2007);  // Move to 180 degrees
+			Delay(10800000);
+			servo_poziyon(675);   // Return to 0 degrees
+			PTB->PCOR = (1 << 1); // Set PTB1 low
+			PTB->PCOR = (1 << 0); // Set PTB1 low
+    }
+}
+
+void setupBuzzerAndLED(void) {
+    // Set up pins for buzzer and LED
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK; // Enable clock for Port B
+    PORTB->PCR[0] = PORT_PCR_MUX(1); // LED on PTB0 as GPIO
+    PORTB->PCR[1] = PORT_PCR_MUX(1); // Buzzer on PTB1 as GPIO
+    PTB->PDDR |= (1 << 0) | (1 << 1); // Set PTB0 and PTB1 as output
+}
+
+
+
+void set_pwm(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK;
+    PORTE->PCR[21] = PORT_PCR_MUX(3); // This was creating a problem so i wrote with the mask not the hexadeciaml represenatation
+		
+    SIM->SCGC6 |= 0x2000000; //tpm1 is ported 
+    SIM->SOPT2 |= 0x1000000; //the 01 of MCGIRCLK is choosen
+    TPM1->SC = 0; // before the setting the values we need to set the 0 to status control since it can create the some disorder
+    TPM1->CONTROLS[1].CnSC = 0x028; //msb and elsb = 1 others are 0 
+    TPM1->MOD = (clock_freq / (prescale * pwm_freq)) - 1; // mod is equivalent to period of the pulse cnv decides the duty cycle of the pulse
+
+    TPM1->CONTROLS[1].CnV = 675; // the pattern start with the 0 degree
+    TPM1->SC = 0x0C;
+}
+
+void set_pwm_for_second_servo(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK;
+    PORTE->PCR[22] = PORT_PCR_MUX(3); // Assume PORTE29 is available for TPM2 Channel 0
+
+    SIM->SCGC6 |= 0x04000000; // Enable TPM2
+    SIM->SOPT2 |= 0x01000000; // Ensure clock source is correctly configured for TPM2 as well
+
+    TPM2->SC = 0; // Disable for configuration
+    TPM2->MOD = (clock_freq / (prescale * pwm_freq)) - 1;
+
+    // TPM2 Channel 0 Setup for second servo
+    TPM2->CONTROLS[0].CnSC = 0x28;
+    TPM2->CONTROLS[0].CnV = 675;
+
+    TPM2->SC = 0x0C; // Re-enable TPM2
+}
+
+void second_servo_position(int pulse_width) {
+    TPM2->CONTROLS[0].CnV = pulse_width;
+}
+
+
+void servo_poziyon(int pulse_genisligi) {
+    TPM1->CONTROLS[1].CnV = pulse_genisligi; // the value of cnv is deciding the pulse width of the cycle such that duty cycle = (CnV/ (mod +1))x100
+}
+
+void processSensor(uint32_t *sensorCount, volatile char *debounceStatus, uint32_t echoPin) {
+    uint32_t start_time = 0, end_time = 0, duration, distance;
+    uint32_t timeout = 1000000; // Timeout counter to avoid getting stuck
+
+    while ((PTE->PDIR & (1 << echoPin)) == 0 && --timeout); // Wait for echo to go high
+    if (timeout) start_time = TIMER_Read();
+
+    timeout = 1000000; // Reset timeout for the end wait
+    while ((PTE->PDIR & (1 << echoPin)) && --timeout); // Wait for echo to go low
+    if (timeout) end_time = TIMER_Read();
+
+    if (end_time > start_time) {
+        duration = end_time - start_time;
+        distance = duration / 58; // Convert time to distance
+
+        if (distance <= MAX_DISTANCE && *debounceStatus) {
+            (*sensorCount)++;
+            *debounceStatus = 0;
+        } else if (distance > MAX_DISTANCE) {
+            *debounceStatus = 1;
+        }
+    }
+}
+
+
+
+void setupSensor(void) {
+    // Enable clock for PORTE for echo pins
+    SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK; // Enable clock to PORTE
+
+    // Configure PTE4 and PTE5 as GPIO input
+    PORTE->PCR[ECHO_PIN_ENTRY] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK;
+    PORTE->PCR[ECHO_PIN_EXIT] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK;
+    PTE->PDDR &= ~((1 << ECHO_PIN_ENTRY) | (1 << ECHO_PIN_EXIT)); // Set PTE4 and PTE5 as input
+}
+
+
+uint32_t TIMER_Read(void) {
+    return TPM0->CNT;
+}    
+
+void Init_TPM1_for_TriggerPulse(void) {
+    SIM->SCGC6 |= SIM_SCGC6_TPM1_MASK;  // Enable clock to TPM1
+    SIM->SCGC5 |= SIM_SCGC5_PORTE_MASK; // Enable clock to PORTE
+
+    // Set PORTE 20 to TPM1_CH0
+    PORTE->PCR[20] = PORT_PCR_MUX(3);   // TPM1_CH0 output on PORTE 20
+
+    SIM->SOPT2 &= ~SIM_SOPT2_TPMSRC_MASK;
+    SIM->SOPT2 |= SIM_SOPT2_TPMSRC(1);  // Clock source: MCGPLLCLK/2 or MCGFLLCLK
+
+    TPM1->SC = 0;                       // Disable TPM1 while configuring
+    TPM1->MOD = 49971;              // Set up modulo for 50ms at 21.6 MHz clock with prescaler of 64
+    TPM1->CONTROLS[0].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK; // Edge-aligned PWM, High-true pulses
+    TPM1->CONTROLS[0].CnV = 13;   // CnV value for 10us pulse, adjust for prescaler
+    TPM1->SC = TPM_SC_CMOD(1) | TPM_SC_PS(4);  // Enable TPM with prescaler 16
+}
